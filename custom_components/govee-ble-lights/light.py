@@ -315,32 +315,44 @@ class GoveeBluetoothLight(LightEntity):
             commands.append(self._prepareSinglePacketData(LedCommand.POWER, [0x1]))
 
         self._state = True
+        is_bar = self._segment is not None and not self._is_master
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            # Brightness (33 04 xx) is device-global on these models.
-            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
             self._brightness = brightness
+            if not is_bar:
+                # 33 04 xx is device-global: only the master (or a
+                # single-entity model) may send it. Bar entities dim by
+                # scaling their RGB instead (below), so the bars can be
+                # dimmed independently.
+                commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
+            self._attr_rgb_color = (red, green, blue)
 
             if self._segment is not None:
-                # H6053-style bar models: 33 05 0D <segment mask> R G B
                 self._last_rgb = (red, green, blue)
-                commands.append(self._prepareSinglePacketData(
-                    LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
+                if not is_bar:
+                    # H6053-style bar models: 33 05 0D <segment mask> R G B
+                    commands.append(self._prepareSinglePacketData(
+                        LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
             elif self._is_segmented:
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
                                                               [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00,
                                                                0x00, 0x00, 0x00, 0xFF, 0x7F]))
             else:
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
-        elif not self._is_master and ATTR_EFFECT not in kwargs:
-            # Bar entity plain "turn on": restore its last color.
+
+        if is_bar and ATTR_EFFECT not in kwargs:
+            # One color write covers color change, per-bar dimming and plain
+            # "turn on" (restore): stored full-brightness RGB scaled by this
+            # bar's own brightness.
             red, green, blue = self._last_rgb
+            level = self._brightness if self._brightness is not None else 255
+            scaled = [min(255, round(c * level / 255)) for c in (red, green, blue)]
             commands.append(self._prepareSinglePacketData(
-                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
+                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment] + scaled))
 
         if ATTR_EFFECT in kwargs and self._is_master:
             effect = kwargs.get(ATTR_EFFECT)
@@ -377,6 +389,7 @@ class GoveeBluetoothLight(LightEntity):
 
         client = await self._connectBluetooth()
         for command in commands:
+            _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
 
