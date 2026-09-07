@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import logging
 import re
 
@@ -297,10 +298,11 @@ class GoveeBluetoothLight(LightEntity):
                                                                       )):
                     commands.append(command)
 
+        client = await self._connectBluetooth()
         for command in commands:
-            _LOGGER.warning("GOVEE-PATCH v3 model=%s seg=%s writing: %s", self._model, self._is_segmented, command.hex())
-            client = await self._connectBluetooth()
+            _LOGGER.warning("GOVEE-PATCH v4 model=%s writing: %s", self._model, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+            await asyncio.sleep(0.2)
 
     async def async_turn_off(self, **kwargs) -> None:
         client = await self._connectBluetooth()
