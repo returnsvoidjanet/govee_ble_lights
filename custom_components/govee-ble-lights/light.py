@@ -268,11 +268,9 @@ class GoveeBluetoothLight(LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
-            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
-            if self._is_segmented:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                                                              [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                                               0x00, 0x00, 0xFF, 0x0F]))
+            # H6053 unit: legacy power(0x01)+brightness(0x04) work but color 0x02/0x15 ignored;
+            # trying RGB_ALT sub-command 0x0D (homebridge: H605x family)
+            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, red, green, blue]))
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
