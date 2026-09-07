@@ -266,14 +266,21 @@ class GoveeBluetoothLight(LightEntity):
         for categoryIdx, category in enumerate(json_data['data']['categories']):
             for sceneIdx, scene in enumerate(category['scenes']):
                 for leffectIdx, lightEffect in enumerate(scene['lightEffects']):
-                    for seffectIxd, specialEffect in enumerate(lightEffect['specialEffect']):
-                        # if 'supportSku' not in specialEffect or self._model in specialEffect['supportSku']:
-                        # Workaround cause we need to store some metadata in effect (effect names not unique)
-                        indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/" + str(
-                            seffectIxd)
-                        effect_list.append(
-                            category['categoryName'] + " - " + scene['sceneName'] + ' - ' + lightEffect[
-                                'scenceName'] + " [" + indexes + "]")
+                    label = category['categoryName'] + " - " + scene['sceneName']
+                    if lightEffect.get('scenceName'):
+                        label += ' - ' + lightEffect['scenceName']
+                    specialEffects = lightEffect.get('specialEffect') or []
+                    if specialEffects:
+                        for seffectIxd, specialEffect in enumerate(specialEffects):
+                            # if 'supportSku' not in specialEffect or self._model in specialEffect['supportSku']:
+                            # Workaround cause we need to store some metadata in effect (effect names not unique)
+                            indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/" + str(
+                                seffectIxd)
+                            effect_list.append(label + " [" + indexes + "]")
+                    elif lightEffect.get('sceneCode'):
+                        # Scene with no per-LED payload: fired as 33 05 04 <sceneCode>.
+                        indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/0"
+                        effect_list.append(label + " [" + indexes + "]")
 
         return effect_list
 
@@ -350,15 +357,23 @@ class GoveeBluetoothLight(LightEntity):
                 category = json_data['data']['categories'][categoryIndex]
                 scene = category['scenes'][sceneIndex]
                 lightEffect = scene['lightEffects'][lightEffectIndex]
-                specialEffect = lightEffect['specialEffect'][specialEffectIndex]
+                specialEffects = lightEffect.get('specialEffect') or []
 
-                # Prepare packets to send big payload in separated chunks
-                for command in prepareMultiplePacketsData(0xa3,
-                                                          array.array('B', [0x02]),
-                                                          array.array('B',
-                                                                      base64.b64decode(specialEffect['scenceParam'])
-                                                                      )):
-                    commands.append(command)
+                if specialEffects and specialEffects[specialEffectIndex].get('scenceParam'):
+                    specialEffect = specialEffects[specialEffectIndex]
+                    # Prepare packets to send big payload in separated chunks
+                    for command in prepareMultiplePacketsData(0xa3,
+                                                              array.array('B', [0x02]),
+                                                              array.array('B',
+                                                                          base64.b64decode(specialEffect['scenceParam'])
+                                                                          )):
+                        commands.append(command)
+                else:
+                    # No per-LED payload: select the scene by its code,
+                    # 33 05 04 <sceneCode> (as captured from the Govee app).
+                    scene_code = int(lightEffect.get('sceneCode') or scene.get('sceneCode') or 0)
+                    commands.append(self._prepareSinglePacketData(
+                        LedCommand.COLOR, [LedMode.SCENE, scene_code & 0xFF]))
 
         client = await self._connectBluetooth()
         for command in commands:
