@@ -268,9 +268,13 @@ class GoveeBluetoothLight(LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
-            # H6053 unit: legacy power(0x01)+brightness(0x04) work but color 0x02/0x15 ignored;
-            # trying RGB_ALT sub-command 0x0D (homebridge: H605x family)
-            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, red, green, blue]))
+            # H6053 whole-bar color = segmented RGBIC cmd with mask 0xFF 0x7F (15 segments),
+            # confirmed working on sibling H6102 (egold reverse-eng). This is the ORIGINAL
+            # mask; it only failed before because packets were burst-dropped - the paced
+            # single-connection write loop below is what makes it actually land.
+            commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
+                            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
+                             0x00, 0x00, 0xFF, 0x7F]))
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
