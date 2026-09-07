@@ -35,6 +35,18 @@ UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
 EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
 
+# Models whose solid color uses the 0x0D sub-command with a segment bitmask
+# (33 05 0D <mask> RR GG BB), verified against a btsnoop capture of the Govee
+# app. Each entry maps to the independently addressable segments exposed as
+# separate HA entities: (name, segment mask, unique_id suffix).
+BAR_SEGMENT_MODELS = {
+    'H6053': [
+        ("Both Bars", 0x11, "both"),
+        ("Bar A", 0x01, "a"),
+        ("Bar B", 0x10, "b"),
+    ],
+}
+
 class LedCommand(IntEnum):
     """ A control command packet's type. """
     POWER = 0x01
@@ -45,11 +57,13 @@ class LedCommand(IntEnum):
 class LedMode(IntEnum):
     """
     The mode in which a color change happens in.
-    
+
     Currently only manual is supported.
     """
     MANUAL = 0x02
+    SCENE = 0x04
     MICROPHONE = 0x06
+    BAR_SEGMENTS = 0x0D
     SCENES = 0x05
     SEGMENTS = 0x15
 
@@ -68,7 +82,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
-        async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+        model = config_entry.data["model"]
+        if model in BAR_SEGMENT_MODELS:
+            async_add_entities([
+                GoveeBluetoothLight(hub, ble_device, config_entry, name=name, segment=segment, suffix=suffix)
+                for name, segment, suffix in BAR_SEGMENT_MODELS[model]
+            ])
+        else:
+            async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -206,20 +227,40 @@ class GoveeAPILight(LightEntity, dict):
 class GoveeBluetoothLight(LightEntity):
     _attr_color_mode = ColorMode.RGB
     _attr_supported_color_modes = {ColorMode.RGB}
-    _attr_supported_features = LightEntityFeature(
-        LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
 
-    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
-        """Initialize an bluetooth light."""
+    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry,
+                 name: str | None = None, segment: int | None = None, suffix: str | None = None) -> None:
+        """Initialize an bluetooth light.
+
+        For BAR_SEGMENT_MODELS, one instance is created per addressable segment:
+        the master ("Both Bars", mask 0x11) plus one per bar. `segment` is the
+        0x0D color bitmask; the master (full mask) also carries global power,
+        while bar entities emulate power via color (off = 000000, on = restore
+        last color) because the device has no per-segment power command.
+        """
         self._mac = hub.address
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._ble_device = ble_device
         self._state = None
         self._brightness = None
+        self._segment = segment
+        self._suffix = suffix
+        self._name = name or "GOVEE Light"
+        # Master = the whole-device entity (also any non bar-segment model).
+        self._is_master = segment is None or segment == 0x11
+        self._last_rgb = (255, 255, 255)
+        if self._is_master:
+            self._attr_supported_features = LightEntityFeature(
+                LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
+        else:
+            self._attr_supported_features = LightEntityFeature(
+                LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
 
     @property
     def effect_list(self) -> list[str] | None:
+        if not self._is_master:
+            return None
         effect_list = []
         json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
         for categoryIdx, category in enumerate(json_data['data']['categories']):
@@ -239,12 +280,15 @@ class GoveeBluetoothLight(LightEntity):
     @property
     def name(self) -> str:
         """Return the name of the switch."""
-        return "GOVEE Light"
+        return self._name
 
     @property
     def unique_id(self) -> str:
         """Return a unique, Home Assistant friendly identifier for this entity."""
-        return self._mac.replace(":", "")
+        mac = self._mac.replace(":", "")
+        if self._suffix:
+            return mac + "_" + self._suffix
+        return mac
 
     @property
     def brightness(self):
@@ -256,22 +300,42 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
-        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
+        commands = []
+
+        # Power (33 01 xx) is device-global; only the master entity sends it.
+        # Bar entities "turn on" by restoring their last color.
+        if self._is_master:
+            commands.append(self._prepareSinglePacketData(LedCommand.POWER, [0x1]))
 
         self._state = True
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
+            # Brightness (33 04 xx) is device-global on these models.
             commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
             self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
-            # H6053 CONFIRMED via btsnoop of the Govee app: solid color = 33 05 0D 01 R G B
-            # (sub-cmd 0x0D + 0x01 group byte). My earlier 0x0D try omitted the 0x01.
-            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, 0x11, red, green, blue]))  # 0x11 = both bars (0x01|0x10)
-        if ATTR_EFFECT in kwargs:
+            if self._segment is not None:
+                # H6053-style bar models: 33 05 0D <segment mask> R G B
+                self._last_rgb = (red, green, blue)
+                commands.append(self._prepareSinglePacketData(
+                    LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
+            elif self._is_segmented:
+                commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
+                                                              [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00,
+                                                               0x00, 0x00, 0x00, 0xFF, 0x7F]))
+            else:
+                commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+        elif not self._is_master and ATTR_EFFECT not in kwargs:
+            # Bar entity plain "turn on": restore its last color.
+            red, green, blue = self._last_rgb
+            commands.append(self._prepareSinglePacketData(
+                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
+
+        if ATTR_EFFECT in kwargs and self._is_master:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
                 search = EFFECT_PARSE.search(effect)
@@ -298,19 +362,27 @@ class GoveeBluetoothLight(LightEntity):
 
         client = await self._connectBluetooth()
         for command in commands:
+            _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
 
     async def async_turn_off(self, **kwargs) -> None:
         client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
+        if self._is_master:
+            # Global power off.
+            command = self._prepareSinglePacketData(LedCommand.POWER, [0x0])
+        else:
+            # No per-segment power: blank this bar's color instead.
+            command = self._prepareSinglePacketData(
+                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, 0x00, 0x00, 0x00])
+        _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
+        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
         self._state = False
 
     async def _connectBluetooth(self) -> BleakClient:
         for i in range(3):
             try:
-                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
+                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self._mac.replace(":", ""))
                 return client
             except:
                 continue
