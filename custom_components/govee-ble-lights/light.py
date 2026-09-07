@@ -268,13 +268,9 @@ class GoveeBluetoothLight(LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
-            # H6053 whole-bar color = segmented RGBIC cmd with mask 0xFF 0x7F (15 segments),
-            # confirmed working on sibling H6102 (egold reverse-eng). This is the ORIGINAL
-            # mask; it only failed before because packets were burst-dropped - the paced
-            # single-connection write loop below is what makes it actually land.
-            commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                             0x00, 0x00, 0xFF, 0x7F]))
+            # H6053 CONFIRMED via btsnoop of the Govee app: solid color = 33 05 0D 01 R G B
+            # (sub-cmd 0x0D + 0x01 group byte). My earlier 0x0D try omitted the 0x01.
+            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, 0x01, red, green, blue]))
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
