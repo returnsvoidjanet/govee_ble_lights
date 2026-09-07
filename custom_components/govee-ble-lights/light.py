@@ -270,7 +270,7 @@ class GoveeBluetoothLight(LightEntity):
 
             # H6053 CONFIRMED via btsnoop of the Govee app: solid color = 33 05 0D 01 R G B
             # (sub-cmd 0x0D + 0x01 group byte). My earlier 0x0D try omitted the 0x01.
-            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, 0x01, red, green, blue]))
+            commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [0x0D, 0x11, red, green, blue]))  # 0x11 = both bars (0x01|0x10)
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
