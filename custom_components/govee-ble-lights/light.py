@@ -299,6 +299,7 @@ class GoveeBluetoothLight(LightEntity):
                     commands.append(command)
 
         for command in commands:
+            _LOGGER.warning("GOVEE-PATCH v3 model=%s seg=%s writing: %s", self._model, self._is_segmented, command.hex())
             client = await self._connectBluetooth()
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
 
