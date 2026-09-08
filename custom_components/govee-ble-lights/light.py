@@ -234,22 +234,24 @@ class GoveeBluetoothLight(LightEntity):
 
         For BAR_SEGMENT_MODELS, one instance is created per addressable segment:
         the master ("Both Bars", mask 0x11) plus one per bar. `segment` is the
-        0x0D color bitmask; the master (full mask) also carries global power,
-        while bar entities emulate power via color (off = 000000, on = restore
-        last color) because the device has no per-segment power command.
+        0x0D color bitmask. Only color is per-segment on this hardware; power
+        (33 01) and brightness (33 04) are device-global, so every entity
+        sends the real global command and all entities share that state.
         """
         self._mac = hub.address
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
         self._ble_device = ble_device
-        self._state = None
-        self._brightness = None
         self._segment = segment
         self._suffix = suffix
         self._name = name or "GOVEE Light"
         # Master = the whole-device entity (also any non bar-segment model).
         self._is_master = segment is None or segment == 0x11
-        self._last_rgb = (255, 255, 255)
+        # On/off and brightness are global: shared across this device's
+        # entities so all of them always display the same values.
+        if not hasattr(hub, "global_light_state"):
+            hub.global_light_state = {"on": None, "brightness": None, "entities": []}
+        self._shared = hub.global_light_state
         if self._is_master:
             self._attr_supported_features = LightEntityFeature(
                 LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
@@ -299,60 +301,56 @@ class GoveeBluetoothLight(LightEntity):
 
     @property
     def brightness(self):
-        return self._brightness
+        return self._shared["brightness"]
 
     @property
     def is_on(self) -> bool | None:
         """Return true if light is on."""
-        return self._state
+        return self._shared["on"]
+
+    async def async_added_to_hass(self) -> None:
+        self._shared["entities"].append(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self in self._shared["entities"]:
+            self._shared["entities"].remove(self)
+
+    def _notify_peers(self) -> None:
+        """Refresh sibling entities so shared on/brightness stays in sync."""
+        for entity in self._shared["entities"]:
+            if entity is not self and getattr(entity, "hass", None) is not None:
+                entity.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs) -> None:
-        commands = []
+        # Power (33 01) is device-global — there is no per-segment power on
+        # this hardware (the controller ignores 000000 segment writes), so
+        # every entity turns the whole device on.
+        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
 
-        # Power (33 01 xx) is device-global; only the master entity sends it.
-        # Bar entities "turn on" by restoring their last color.
-        if self._is_master:
-            commands.append(self._prepareSinglePacketData(LedCommand.POWER, [0x1]))
-
-        self._state = True
-        is_bar = self._segment is not None and not self._is_master
+        self._shared["on"] = True
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            self._brightness = brightness
-            if not is_bar:
-                # 33 04 xx is device-global: only the master (or a
-                # single-entity model) may send it. Bar entities dim by
-                # scaling their RGB instead (below), so the bars can be
-                # dimmed independently.
-                commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
+            # Brightness (33 04) is device-global as well: real level, sent
+            # unmodified from any entity.
+            self._shared["brightness"] = brightness
+            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
             self._attr_rgb_color = (red, green, blue)
 
             if self._segment is not None:
-                self._last_rgb = (red, green, blue)
-                if not is_bar:
-                    # H6053-style bar models: 33 05 0D <segment mask> R G B
-                    commands.append(self._prepareSinglePacketData(
-                        LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
+                # H6053-style bar models: 33 05 0D <segment mask> R G B —
+                # the only per-segment control the hardware offers.
+                commands.append(self._prepareSinglePacketData(
+                    LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, red, green, blue]))
             elif self._is_segmented:
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
                                                               [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00,
                                                                0x00, 0x00, 0x00, 0xFF, 0x7F]))
             else:
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
-
-        if is_bar and ATTR_EFFECT not in kwargs:
-            # One color write covers color change, per-bar dimming and plain
-            # "turn on" (restore): stored full-brightness RGB scaled by this
-            # bar's own brightness.
-            red, green, blue = self._last_rgb
-            level = self._brightness if self._brightness is not None else 255
-            scaled = [min(255, round(c * level / 255)) for c in (red, green, blue)]
-            commands.append(self._prepareSinglePacketData(
-                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment] + scaled))
 
         if ATTR_EFFECT in kwargs and self._is_master:
             effect = kwargs.get(ATTR_EFFECT)
@@ -389,20 +387,19 @@ class GoveeBluetoothLight(LightEntity):
 
         client = await self._connectBluetooth()
         for command in commands:
+            _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
+        self._notify_peers()
 
     async def async_turn_off(self, **kwargs) -> None:
         client = await self._connectBluetooth()
-        if self._is_master:
-            # Global power off.
-            command = self._prepareSinglePacketData(LedCommand.POWER, [0x0])
-        else:
-            # No per-segment power: blank this bar's color instead.
-            command = self._prepareSinglePacketData(
-                LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment, 0x00, 0x00, 0x00])
+        # Global power off — the only off the hardware supports.
+        command = self._prepareSinglePacketData(LedCommand.POWER, [0x0])
+        _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
-        self._state = False
+        self._shared["on"] = False
+        self._notify_peers()
 
     async def _connectBluetooth(self) -> BleakClient:
         for i in range(3):
