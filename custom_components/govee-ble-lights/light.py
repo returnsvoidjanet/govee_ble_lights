@@ -387,7 +387,6 @@ class GoveeBluetoothLight(LightEntity):
 
         client = await self._connectBluetooth()
         for command in commands:
-            _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
         self._notify_peers()
@@ -396,7 +395,6 @@ class GoveeBluetoothLight(LightEntity):
         client = await self._connectBluetooth()
         # Global power off — the only off the hardware supports.
         command = self._prepareSinglePacketData(LedCommand.POWER, [0x0])
-        _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
         self._shared["on"] = False
         self._notify_peers()
