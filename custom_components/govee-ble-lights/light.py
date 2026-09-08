@@ -250,6 +250,7 @@ class GoveeBluetoothLight(LightEntity):
         self._name = name or "GOVEE Light"
         # Master = the whole-device entity (also any non bar-segment model).
         self._is_master = segment is None or segment == 0x11
+        self._hub = hub
         self._state = None
         self._brightness = None
         self._last_rgb = (255, 255, 255)
@@ -308,6 +309,36 @@ class GoveeBluetoothLight(LightEntity):
     def is_on(self) -> bool | None:
         """Return true if light is on."""
         return self._state
+
+    async def async_added_to_hass(self) -> None:
+        entities = getattr(self._hub, "bar_light_entities", None)
+        if entities is None:
+            entities = self._hub.bar_light_entities = []
+        entities.append(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self in getattr(self._hub, "bar_light_entities", []):
+            self._hub.bar_light_entities.remove(self)
+
+    def _propagate_to_bars(self, on, rgb=None, brightness=None) -> None:
+        """Mirror state the master just applied onto the bar entities.
+
+        Master commands are physically device-wide (global power/brightness,
+        color mask 0x11 hits both bars), so the bar entities' optimistic
+        state must follow what the master applied.
+        """
+        if not (self._is_master and self._segment is not None):
+            return
+        for entity in getattr(self._hub, "bar_light_entities", []):
+            if entity is self or getattr(entity, "hass", None) is None:
+                continue
+            entity._state = on
+            if on and rgb is not None:
+                entity._attr_rgb_color = tuple(rgb)
+                entity._last_rgb = tuple(rgb)
+            if on and brightness is not None:
+                entity._brightness = brightness
+            entity.async_write_ha_state()
 
     def _scaled_bar_rgb(self, level):
         """This bar's stored full RGB scaled by level/255, floored non-black.
@@ -406,6 +437,10 @@ class GoveeBluetoothLight(LightEntity):
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
 
+        if self._is_master:
+            self._propagate_to_bars(True, rgb=kwargs.get(ATTR_RGB_COLOR),
+                                    brightness=kwargs.get(ATTR_BRIGHTNESS))
+
     async def async_turn_off(self, **kwargs) -> None:
         client = await self._connectBluetooth()
         if self._is_master:
@@ -419,6 +454,8 @@ class GoveeBluetoothLight(LightEntity):
                 LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment] + self._scaled_bar_rgb(1))
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
         self._state = False
+        if self._is_master:
+            self._propagate_to_bars(False)
 
     async def _connectBluetooth(self) -> BleakClient:
         for i in range(3):
