@@ -403,7 +403,6 @@ class GoveeBluetoothLight(LightEntity):
 
         client = await self._connectBluetooth()
         for command in commands:
-            _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
             await asyncio.sleep(0.2)
 
@@ -418,7 +417,6 @@ class GoveeBluetoothLight(LightEntity):
             # the bar would stay on its previous color).
             command = self._prepareSinglePacketData(
                 LedCommand.COLOR, [LedMode.BAR_SEGMENTS, self._segment] + self._scaled_bar_rgb(1))
-        _LOGGER.warning("BYTES seg=%s %s", self._segment, command.hex())
         await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
         self._state = False
 
